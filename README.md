@@ -50,7 +50,7 @@ flowchart LR
 
 ### 1. 获取程序
 
-**方式 A（推荐）**：到 [Releases](../../releases) 页面下载 `NetScheduler.exe`。
+**方式 A（推荐）**：到 [Releases](../../releases) 页面下载 `NetScheduler-v1.0.3.zip`（内含主程序与一键安装/卸载脚本），解压后按下面步骤安装。仅下载单个 `NetScheduler.exe` 也能运行（.NET Framework 4.8 为 Windows 内置），但不会注册开机自启，需每次开机后手动启动。
 
 **方式 B（从源码构建）**：克隆或下载本仓库，双击 `build.bat`。构建使用 Windows 自带的
 C# 编译器（.NET Framework 4.x），**无需安装任何 SDK 或运行库**。
