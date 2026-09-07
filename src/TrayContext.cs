@@ -11,7 +11,8 @@ using Timer = System.Windows.Forms.Timer;
 namespace NetScheduler
 {
     /// <summary>
-    /// 隐藏窗口 + 托盘图标：右键菜单（状态显示 / 手动模式 / 立即应用 / 配置 / 日志 / 退出），
+    /// 隐藏窗口 + 托盘图标。菜单只创建一次，之后仅原地更新文字/勾选/图标——
+    /// 重建销毁菜单会导致勾选状态不同步，也会在菜单打开时销毁句柄。
     /// 配置文件保存后自动热更新。
     /// </summary>
     public class TrayContext : Form
@@ -20,16 +21,28 @@ namespace NetScheduler
         private readonly NotifyIcon _icon;
         private readonly Engine _engine;
         private readonly Timer _tickTimer;
-        private readonly Timer _debounceTimer;
+        private readonly Timer _uiTimer;
         private readonly Dictionary<string, Icon> _iconCache = new Dictionary<string, Icon>();
+        private long _lastFsEvent = 0; // 配置文件最近一次变更的时钟（Ticks），用于去抖
         private FileSystemWatcher _watcher;
         private ContextMenuStrip _menu;
+
+        // 状态行（不可点，实时同步真实状态）
+        private ToolStripMenuItem _stWired, _stControl, _stNext;
+        // 控制模式
+        private ToolStripMenuItem _miCtrlAuto, _miCtrlManual, _miBootWired;
+        // 强制
+        private ToolStripMenuItem _miFollow, _miForceOn, _miForceOff;
 
         public TrayContext()
         {
             ShowInTaskbar = false;
             FormBorderStyle = FormBorderStyle.None;
             WindowState = FormWindowState.Minimized;
+
+            // 关键：永不显示的窗口默认没有原生句柄，BeginInvoke 会静默失败，
+            // 导致菜单/气泡永远不刷新。访问 Handle 强制创建句柄。
+            IntPtr forceHandle = Handle;
 
             string exeDir = AppDomain.CurrentDomain.BaseDirectory;
             _configPath = Path.Combine(exeDir, "config.ini");
@@ -45,15 +58,15 @@ namespace NetScheduler
             _engine = new Engine(_configPath, cfg);
             _engine.UiChanged = RefreshUi;
             _engine.NotifyUser = ShowBalloon;
-            Logger.Info(string.Format("启动完成 管理员={0} 有线网卡=\"{1}\" 热点=\"{2}\"",
-                _engine.IsAdmin, _engine.ResolvedEthernet, cfg.WifiProfile));
+            Logger.Info(string.Format("启动完成 管理员={0} 有线网卡=\"{1}\" 热点=\"{2}\" 控制={3}",
+                _engine.IsAdmin, _engine.ResolvedEthernet, cfg.WifiProfile, _engine.ControlStatusText()));
 
             _icon = new NotifyIcon
             {
                 Text = "NetScheduler",
                 Visible = true
             };
-            _icon.ContextMenuStrip = BuildMenu();
+            BuildMenuOnce();
             _icon.MouseClick += delegate(object s, MouseEventArgs e)
             {
                 if (e.Button == MouseButtons.Left) ShowStatusBalloon();
@@ -64,15 +77,15 @@ namespace NetScheduler
             _tickTimer.Tick += delegate { ThreadPool.QueueUserWorkItem(delegate { _engine.Tick(); }); };
             _tickTimer.Start();
 
-            _debounceTimer = new Timer { Interval = 800 };
-            _debounceTimer.Tick += delegate
-            {
-                _debounceTimer.Stop();
-                ReloadConfig();
-            };
+            // UI 线程定时器兜底刷新：Tick 事件在 UI 线程触发，直接读取引擎状态同步菜单，
+            // 不依赖跨线程投递，保证状态行/勾选/图标永远与真实状态一致
+            _uiTimer = new Timer { Interval = 1000 };
+            _uiTimer.Tick += delegate { DoUpdateMenu(); };
+            _uiTimer.Start();
 
             SetupWatcher();
 
+            DoUpdateMenu();
             ThreadPool.QueueUserWorkItem(delegate { _engine.Tick(); });
             if (!_engine.IsAdmin)
                 ShowBalloon("NetScheduler", "未以管理员身份运行，无法自动切换网卡（仅监控）");
@@ -83,63 +96,56 @@ namespace NetScheduler
             base.SetVisibleCore(false); // 永不显示窗口
         }
 
-        // ---------- 菜单 ----------
+        // ---------- 菜单（仅创建一次，动态内容在 DoUpdateMenu 中更新） ----------
 
-        private ContextMenuStrip BuildMenu()
+        private void BuildMenuOnce()
         {
-            ContextMenuStrip menu = new ContextMenuStrip();
+            _menu = new ContextMenuStrip();
 
-            string wired;
-            switch (_engine.LastActual)
-            {
-                case WiredState.On: wired = "开启"; break;
-                case WiredState.Off: wired = "已断开"; break;
-                default: wired = "未知"; break;
-            }
+            _stWired = new ToolStripMenuItem("有线网络") { Enabled = false };
+            _stControl = new ToolStripMenuItem("控制") { Enabled = false };
+            _stNext = new ToolStripMenuItem("下次切换") { Enabled = false };
+            _menu.Items.AddRange(new ToolStripItem[] { _stWired, _stControl, _stNext, new ToolStripSeparator() });
 
-            ToolStripMenuItem st1 = new ToolStripMenuItem("有线网络: " + wired +
-                (_engine.IsAdmin ? "" : "  (无管理员权限，仅监控)")) { Enabled = false };
-            ToolStripMenuItem st2 = new ToolStripMenuItem("模式: " + ModeText.Get(_engine.CurrentMode) +
-                _engine.ManualExpiresText()) { Enabled = false };
-            ToolStripMenuItem st3 = new ToolStripMenuItem("下次切换: " + _engine.NextBoundaryText()) { Enabled = false };
-            menu.Items.Add(st1);
-            menu.Items.Add(st2);
-            menu.Items.Add(st3);
-            menu.Items.Add(new ToolStripSeparator());
+            ToolStripMenuItem ctrlMenu = new ToolStripMenuItem("控制模式");
+            _miCtrlAuto = new ToolStripMenuItem("自动（按计划调度，可临时强制）");
+            _miCtrlAuto.Click += delegate { _engine.SetControl(ControlMode.Auto); };
+            _miCtrlManual = new ToolStripMenuItem("手动（完全手动，不自动切换）");
+            _miCtrlManual.Click += delegate { _engine.SetControl(ControlMode.Manual); };
+            _miBootWired = new ToolStripMenuItem("手动模式下每次开机启用有线");
+            _miBootWired.Click += delegate { _engine.ToggleBootWired(); };
+            ctrlMenu.DropDownItems.AddRange(new ToolStripItem[]
+            { _miCtrlAuto, _miCtrlManual, new ToolStripSeparator(), _miBootWired });
+            _menu.Items.Add(ctrlMenu);
 
-            ToolStripMenuItem mode = new ToolStripMenuItem("模式");
-            ToolStripMenuItem miAuto = new ToolStripMenuItem("跟随计划");
-            ToolStripMenuItem miOn = new ToolStripMenuItem("强制有线开");
-            ToolStripMenuItem miOff = new ToolStripMenuItem("强制有线关");
-            miAuto.Checked = _engine.CurrentMode == Mode.Auto;
-            miOn.Checked = _engine.CurrentMode == Mode.ForceOn;
-            miOff.Checked = _engine.CurrentMode == Mode.ForceOff;
-            miAuto.Click += delegate { _engine.SetMode(Mode.Auto); };
-            miOn.Click += delegate { _engine.SetMode(Mode.ForceOn); };
-            miOff.Click += delegate { _engine.SetMode(Mode.ForceOff); };
-            mode.DropDownItems.Add(miAuto);
-            mode.DropDownItems.Add(miOn);
-            mode.DropDownItems.Add(miOff);
-            menu.Items.Add(mode);
+            ToolStripMenuItem forceMenu = new ToolStripMenuItem("强制");
+            _miFollow = new ToolStripMenuItem("跟随计划");
+            _miFollow.Click += delegate { _engine.SetFollow(); };
+            _miForceOn = new ToolStripMenuItem("强制有线开");
+            _miForceOn.Click += delegate { _engine.SetForce(Mode.ForceOn); };
+            _miForceOff = new ToolStripMenuItem("强制有线关");
+            _miForceOff.Click += delegate { _engine.SetForce(Mode.ForceOff); };
+            forceMenu.DropDownItems.AddRange(new ToolStripItem[] { _miFollow, _miForceOn, _miForceOff });
+            _menu.Items.Add(forceMenu);
 
             ToolStripMenuItem apply = new ToolStripMenuItem("立即对账");
             apply.Click += delegate { ThreadPool.QueueUserWorkItem(delegate { _engine.Tick(); }); };
-            menu.Items.Add(apply);
-            menu.Items.Add(new ToolStripSeparator());
+            _menu.Items.Add(apply);
+            _menu.Items.Add(new ToolStripSeparator());
 
             ToolStripMenuItem openCfg = new ToolStripMenuItem("打开配置文件");
             openCfg.Font = new Font(openCfg.Font, FontStyle.Bold);
             openCfg.Click += delegate { OpenConfig(); };
-            menu.Items.Add(openCfg);
+            _menu.Items.Add(openCfg);
 
             ToolStripMenuItem reload = new ToolStripMenuItem("重载配置");
             reload.Click += delegate { ReloadConfig(); };
-            menu.Items.Add(reload);
+            _menu.Items.Add(reload);
 
             ToolStripMenuItem openLog = new ToolStripMenuItem("打开日志");
             openLog.Click += delegate { OpenFile(Logger.LogPath); };
-            menu.Items.Add(openLog);
-            menu.Items.Add(new ToolStripSeparator());
+            _menu.Items.Add(openLog);
+            _menu.Items.Add(new ToolStripSeparator());
 
             ToolStripMenuItem exit = new ToolStripMenuItem("退出");
             exit.Click += delegate
@@ -148,31 +154,41 @@ namespace NetScheduler
                 _icon.Visible = false;
                 Close();
             };
-            menu.Items.Add(exit);
+            _menu.Items.Add(exit);
 
-            Icon cur = _engine.LastActual == WiredState.Off
-                ? MakeIcon(Color.FromArgb(224, 64, 64))
-                : (_engine.LastActual.HasValue ? MakeIcon(Color.FromArgb(64, 176, 80)) : MakeIcon(Color.FromArgb(220, 160, 32)));
-            if (_icon.Icon != null) { try { _icon.Icon.Dispose(); } catch { } }
-            _icon.Icon = cur;
-
-            ContextMenuStrip old = _menu;
-            _menu = menu;
-            if (old != null)
-            {
-                try { old.Dispose(); } catch { }
-            }
-            return menu;
+            _icon.ContextMenuStrip = _menu;
         }
 
+        /// <summary>后台线程回调：切回 UI 线程更新菜单。</summary>
         private void RefreshUi()
+        {
+            try { BeginInvoke((Action)DoUpdateMenu); } catch { }
+        }
+
+        /// <summary>把引擎的真实状态同步到菜单文字/勾选与托盘图标颜色。</summary>
+        private void DoUpdateMenu()
         {
             try
             {
-                BeginInvoke((Action)delegate
-                {
-                    try { BuildMenu(); } catch { }
-                });
+                string wired = _engine.LastActual == WiredState.Off ? "已断开"
+                    : (_engine.LastActual == WiredState.On ? "开启" : "未知");
+                _stWired.Text = "有线网络: " + wired + (_engine.IsAdmin ? "" : "  (无管理员权限，仅监控)");
+                _stControl.Text = "控制: " + _engine.ControlStatusText();
+                _stNext.Text = "下次切换: " + _engine.NextBoundaryText();
+
+                _miCtrlAuto.Checked = _engine.Control == ControlMode.Auto;
+                _miCtrlManual.Checked = _engine.Control == ControlMode.Manual;
+                _miBootWired.Checked = _engine.Config.EnableWiredOnStart;
+
+                _miFollow.Checked = _engine.Control == ControlMode.Auto && _engine.CurrentMode == Mode.Auto;
+                _miForceOn.Checked = _engine.CurrentMode == Mode.ForceOn;
+                _miForceOff.Checked = _engine.CurrentMode == Mode.ForceOff;
+
+                // 图标按颜色缓存、只创建一次，从不 Dispose（避免把已释放图标赋给 NotifyIcon 导致崩溃）
+                Icon cur = _engine.LastActual == WiredState.Off
+                    ? MakeIcon(Color.FromArgb(224, 64, 64))
+                    : (_engine.LastActual.HasValue ? MakeIcon(Color.FromArgb(64, 176, 80)) : MakeIcon(Color.FromArgb(220, 160, 32)));
+                if (!ReferenceEquals(_icon.Icon, cur)) _icon.Icon = cur;
             }
             catch { }
         }
@@ -193,10 +209,10 @@ namespace NetScheduler
 
         private void ShowStatusBalloon()
         {
-            string wired = _engine.LastActual == WiredState.Off ? "已断开" :
-                (_engine.LastActual == WiredState.On ? "开启" : "未知");
+            string wired = _engine.LastActual == WiredState.Off ? "已断开"
+                : (_engine.LastActual == WiredState.On ? "开启" : "未知");
             ShowBalloon("NetScheduler",
-                "有线网络: " + wired + "\r\n模式: " + ModeText.Get(_engine.CurrentMode) +
+                "有线网络: " + wired + "\r\n控制: " + _engine.ControlStatusText() +
                 "\r\n下次切换: " + _engine.NextBoundaryText());
         }
 
@@ -220,10 +236,33 @@ namespace NetScheduler
             AppConfig cfg = LoadConfigSafe();
             _engine.Config = cfg;
             _engine.ResolveEthernet();
-            _engine.CurrentMode = Mode.Auto; // 配置变更后回到跟随计划，避免旧强制状态残留
+            _engine.ResolveWifiProfile();
             _tickTimer.Interval = Math.Max(15, cfg.CheckIntervalSec) * 1000;
             Logger.Info("配置已重载: 有线网卡=\"" + _engine.ResolvedEthernet + "\" 热点=\"" + cfg.WifiProfile + "\"");
             ThreadPool.QueueUserWorkItem(delegate { _engine.Tick(); });
+        }
+
+        /// <summary>配置文件变更去抖：FileSystemWatcher 回调在后台线程，去抖放在线程池做，
+        /// 重载本身通过 BeginInvoke 切回 UI 线程（WinForms Timer / 控件只能在 UI 线程操作）。</summary>
+        private void OnConfigChanged()
+        {
+            try
+            {
+                long now = DateTime.Now.Ticks;
+                Interlocked.Exchange(ref _lastFsEvent, now);
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    Thread.Sleep(800);
+                    if (Interlocked.CompareExchange(ref _lastFsEvent, 0, 0) == now)
+                    {
+                        try { BeginInvoke((Action)ReloadConfig); } catch { }
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn("监听配置变更异常(可用菜单手动重载): " + ex.Message);
+            }
         }
 
         private void SetupWatcher()
@@ -232,8 +271,9 @@ namespace NetScheduler
             {
                 _watcher = new FileSystemWatcher(Path.GetDirectoryName(_configPath), "config.ini");
                 _watcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName;
-                _watcher.Changed += delegate { _debounceTimer.Stop(); _debounceTimer.Start(); };
-                _watcher.Renamed += delegate { _debounceTimer.Stop(); _debounceTimer.Start(); };
+                _watcher.Changed += delegate { OnConfigChanged(); };
+                _watcher.Renamed += delegate { OnConfigChanged(); };
+                _watcher.Created += delegate { OnConfigChanged(); };
                 _watcher.EnableRaisingEvents = true;
             }
             catch (Exception ex)
@@ -289,7 +329,7 @@ namespace NetScheduler
             if (disposing)
             {
                 _tickTimer.Stop();
-                _debounceTimer.Stop();
+                if (_uiTimer != null) _uiTimer.Stop();
                 if (_watcher != null) _watcher.Dispose();
                 if (_icon != null) { _icon.Visible = false; _icon.Dispose(); }
             }

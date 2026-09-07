@@ -36,10 +36,48 @@ namespace NetScheduler
             return null;
         }
 
-        /// <summary>启用/禁用网卡，返回是否成功。</summary>
+        /// <summary>
+        /// 启用/禁用网卡，返回是否成功（以切换后实际查询验证为准）。
+        /// 主路径用 netsh：部分网卡上 WMI 的 Enable/Disable 会返回 0 但实际不生效（假成功）。
+        /// </summary>
         public static bool SetAdapter(string connId, bool enable)
         {
             if (string.IsNullOrEmpty(connId)) return false;
+
+            // 1) netsh 切换
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("netsh",
+                    "interface set interface name=\"" + connId + "\" " +
+                    (enable ? "admin=enable" : "admin=disable"));
+                psi.CreateNoWindow = true;
+                psi.UseShellExecute = false;
+                psi.RedirectStandardError = true;
+                using (Process p = Process.Start(psi))
+                {
+                    string err = p.StandardError.ReadToEnd();
+                    p.WaitForExit(8000);
+                    if (!p.HasExited || p.ExitCode != 0)
+                    {
+                        Logger.Error("netsh " + (enable ? "启用" : "禁用") + "网卡失败: " +
+                                     (string.IsNullOrEmpty(err) ? "exit=" + p.ExitCode : err.Trim()));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("netsh 切换网卡异常: " + ex.Message);
+            }
+
+            // 2) 实际验证（最长约 4 秒，驱动启动可能稍有延迟）
+            for (int i = 0; i < 4; i++)
+            {
+                System.Threading.Thread.Sleep(1000);
+                bool? s = GetAdapterEnabled(connId);
+                if (s.HasValue && s.Value == enable) return true;
+            }
+
+            // 3) 兜底：WMI 再试一次并验证（个别系统 netsh 被策略限制）
             try
             {
                 string q = "SELECT * FROM Win32_NetworkAdapter WHERE NetConnectionID = '" +
@@ -51,19 +89,35 @@ namespace NetScheduler
                         using (o)
                         {
                             object rc = o.InvokeMethod(enable ? "Enable" : "Disable", null);
-                            return rc != null && Convert.ToUInt32(rc) == 0;
+                            if (rc == null || Convert.ToUInt32(rc) != 0) break;
+                            for (int i = 0; i < 3; i++)
+                            {
+                                System.Threading.Thread.Sleep(1000);
+                                bool? st = GetAdapterEnabled(connId);
+                                if (st.HasValue && st.Value == enable) return true;
+                            }
                         }
                     }
                 }
             }
             catch (Exception ex)
             {
-                Logger.Error("切换网卡失败: " + ex.Message);
+                Logger.Error("WMI 切换网卡异常: " + ex.Message);
             }
             return false;
         }
 
-        /// <summary>自动检测有线网卡连接名：物理网卡中排除无线/蓝牙后的第一个。</summary>
+        /// <summary>无线/手机共享等应当排除的网卡关键词（匹配连接名与描述的小写形式）。</summary>
+        private static readonly string[] ExcludedKeywords =
+        {
+            "wi-fi", "wifi", "wireless", "802.11", "wlan", "bluetooth", "蓝牙",
+            "rndis", "remote ndis", "tether", "共享", "手机",
+            "oppo", "xiaomi", "huawei", "honor", "samsung", "android",
+            "iphone", "apple mobile", "oneplus", "realme", "vivo", "redmi"
+        };
+
+        /// <summary>自动检测有线网卡连接名：物理网卡中排除无线/蓝牙/手机共享后的第一个，
+        /// 多个候选时优先选名字里带"以太网/Ethernet"的。</summary>
         public static string DetectEthernetName()
         {
             try
@@ -71,6 +125,7 @@ namespace NetScheduler
                 string q = "SELECT NetConnectionID, Name, Description FROM Win32_NetworkAdapter WHERE PhysicalAdapter = TRUE";
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(q))
                 {
+                    string first = null, preferred = null;
                     foreach (ManagementObject o in s.Get())
                     {
                         using (o)
@@ -79,14 +134,22 @@ namespace NetScheduler
                             if (string.IsNullOrEmpty(id)) continue;
                             string desc = (Convert.ToString(o["Description"]) ?? "") + " " +
                                           (Convert.ToString(o["Name"]) ?? "");
-                            string dl = desc.ToLowerInvariant();
-                            if (dl.Contains("wi-fi") || dl.Contains("wifi") || dl.Contains("wireless") ||
-                                dl.Contains("802.11") || dl.Contains("wlan") || dl.Contains("bluetooth") ||
-                                desc.Contains("无线") || desc.Contains("蓝牙"))
-                                continue;
-                            return id;
+                            string all = (id + " " + desc).ToLowerInvariant();
+                            bool excluded = false;
+                            foreach (string k in ExcludedKeywords)
+                            {
+                                if (all.Contains(k)) { excluded = true; break; }
+                            }
+                            if (excluded) continue;
+                            if (first == null) first = id;
+                            if (preferred == null &&
+                                (id.Contains("以太网") ||
+                                 id.IndexOf("Ethernet", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                 id.StartsWith("本地连接")))
+                                preferred = id;
                         }
                     }
+                    return preferred ?? first;
                 }
             }
             catch (Exception ex)

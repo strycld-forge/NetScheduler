@@ -36,7 +36,7 @@ namespace NetScheduler
     public class AppConfig
     {
         public List<int> OffDays = new List<int>(new int[] { 0, 1, 2, 3, 4 });
-        public string OffTime = "22:00";
+        public string OffTime = "22:30";
         public string OnTime = "05:00";
         public string EthernetName = "";
         public string WifiProfile = "";
@@ -44,6 +44,7 @@ namespace NetScheduler
         public int RetryIntervalSec = 30;
         public List<WhitelistRange> Whitelist = new List<WhitelistRange>();
         public bool ManualExpiresNextEvent = true;
+        public bool EnableWiredOnStart = true;
         public bool KeepWifiConnected = true;
         public int CheckIntervalSec = 60;
         public int LogMaxSizeKB = 1024;
@@ -51,7 +52,7 @@ namespace NetScheduler
         public TimeSpan GetOffTime()
         {
             TimeSpan t;
-            return TimeSpan.TryParse(OffTime, out t) ? t : new TimeSpan(22, 0, 0);
+            return TimeSpan.TryParse(OffTime, out t) ? t : new TimeSpan(22, 30, 0);
         }
 
         public TimeSpan GetOnTime()
@@ -168,6 +169,7 @@ namespace NetScheduler
                     case "RetryIntervalSec": int.TryParse(val, out cfg.RetryIntervalSec); break;
                     case "Whitelist": wl = ParseWhitelist(val); break;
                     case "ManualExpiresNextEvent": cfg.ManualExpiresNextEvent = IsTrue(val); break;
+                    case "EnableWiredOnStart": cfg.EnableWiredOnStart = IsTrue(val); break;
                     case "KeepWifiConnected": cfg.KeepWifiConnected = IsTrue(val); break;
                     case "CheckIntervalSec": int.TryParse(val, out cfg.CheckIntervalSec); break;
                     case "LogMaxSizeKB": int.TryParse(val, out cfg.LogMaxSizeKB); break;
@@ -259,13 +261,14 @@ namespace NetScheduler
 @"# ================= NetScheduler 配置文件 =================
 # 修改保存后自动生效，无需重启程序。
 # 以 '#' 或 ';' 开头的行为注释。
+# 控制模式（自动/手动）在托盘菜单里切换，状态保存在同目录 state.ini。
 # =========================================================
 
 [Schedule]
 # 断网生效的星期，0=周日 1=周一 ... 6=周六，逗号分隔
 OffDays = 0,1,2,3,4
 # 断网时刻（此时刻起禁用有线网卡）
-OffTime = 22:00
+OffTime = 22:30
 # 恢复时刻（此时刻起重新启用有线网卡）
 OnTime = 05:00
 
@@ -274,6 +277,8 @@ OnTime = 05:00
 # 留空 = 自动检测（检测到后会自动写回这里）
 EthernetName =
 # 手机热点的 Wi-Fi 配置文件名（一般就是热点名/SSID，需先手动连接保存过一次）
+# 留空 = 自动检测（连着 Wi-Fi 时自动写回这里）。不填时断网后靠系统自动连接，
+# 但主动秒连和掉线自动重连功能需要填上它（推荐连一次热点让它自动写入）。
 WifiProfile =
 # 断网时主动连接热点的重试次数与间隔（秒）；重试用尽后每分钟对账仍会继续尝试
 ConnectRetries = 5
@@ -286,8 +291,10 @@ RetryIntervalSec = 30
 Whitelist =
 
 [Behavior]
-# true = 手动强制开/关 到下一个定时点后自动恢复为跟随计划（防止忘了改回来）
+# true = 自动模式下，手动强制开/关 到下一个定时点后自动恢复为跟随计划（防止忘了改回来）
 ManualExpiresNextEvent = true
+# true = 手动控制模式下，每次开机（程序启动）自动启用有线
+EnableWiredOnStart = true
 # 断网时段内若 Wi-Fi 掉线，每分钟自动重连热点
 KeepWifiConnected = true
 # 状态对账间隔（秒），越小反应越快，资源占用也几乎不变
